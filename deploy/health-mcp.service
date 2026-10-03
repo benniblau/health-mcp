@@ -1,0 +1,25 @@
+[Unit]
+Description=Apple Health MCP Server (Health Auto Export ingest + Streamable HTTP + REST API)
+After=network.target
+
+[Service]
+Type=simple
+User=benni
+Group=benni
+WorkingDirectory=/home/benni/health-mcp
+ExecStart=/home/benni/health-mcp/.venv/bin/python /home/benni/health-mcp/mcp_server.py --transport http
+EnvironmentFile=/home/benni/health-mcp/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening. ProtectHome is deliberately NOT set: this service lives under
+# /home/benni, so protecting /home would hide its own working directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/benni/health-mcp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+# Credentials and secrets
+.env
+
+# Database — personal health data
+*.db
+*.db-shm
+*.db-wal
+
+# Captured payloads used as test fixtures are personal health data too
+tests/fixtures/
+
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
