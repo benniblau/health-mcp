@@ -26,3 +26,11 @@ build/
 .idea/
 .vscode/
 *.swp
+
+# Diagnostics dropped into the project folder — request logs and app config
+request-audit-logs-*.csv
+hae_export_*.json
+HealthAutoExport-automation-logs-*/
+
+# Strava OAuth tokens, written by strava_downloader.py
+.strava_token.json

@@ -16,8 +16,8 @@ Claude ──────────────── /mcp (streamable HTTP) �
 ## Status
 
 **Phase 1 of 5 — capture.** The server receives exports and archives every one
-unmodified. It does not parse them yet, so there is nothing to ask Claude about
-beyond *what has arrived*.
+unmodified, but does not parse them yet. Strava is mirrored and queryable
+(see below), so running history can be analysed today.
 
 | Phase | | |
 |---|---|---|
@@ -167,11 +167,36 @@ curl -H "Authorization: Bearer $HEALTH_MCP_AUTH_TOKEN" \
 
 | Tool | |
 |---|---|
-| `get_sync_status` | when the phone last sent data and what each recent export held |
+| `get_sync_status` | when the phone last sent data, what each export held, and when Strava last synced |
+| `query_strava_activities` | list activities by sport, date and distance |
+| `get_strava_activity` | one activity in full: laps, 1 km splits, best efforts, zones, optionally the recorded samples |
+| `get_running_progress` | runs, distance, pace and heart rate per week or month, plus Strava's totals |
+| `get_best_efforts` | fastest time per standard distance, or the progression over one distance |
+| `get_strava_athlete` | profile, run totals, shoes |
+| `execute_sql` | read-only `SELECT` over everything |
 
-That is all, until phase 3. Planned: `query_workouts`, `get_workout_details`,
-`get_running_progress`, `get_best_efforts`, `get_health_trend` and a read-only
-`execute_sql`.
+The Apple Health side has no tools yet: exports are archived but not parsed
+(phase 2).
+
+## Strava
+
+Optional. `strava_downloader.py` mirrors one athlete's Strava account into the
+same database — useful because Strava usually holds the running history from
+before the watch.
+
+```bash
+.venv/bin/python strava_downloader.py --auth-url         # link to authorize with
+.venv/bin/python strava_downloader.py --authorize CODE   # exchange the code
+.venv/bin/python strava_downloader.py --with-streams     # sync; everything on a first run
+```
+
+`.env.example` walks through creating the API application. It asks for
+read-only scopes and never writes to Strava. Tokens are kept in
+`.strava_token.json` (mode 600). To keep it current, run it from cron:
+
+```
+30 * * * * /path/to/.venv/bin/python /path/to/strava_downloader.py --with-streams >> /path/to/download.log 2>&1
+```
 
 ## REST API
 

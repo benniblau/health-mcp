@@ -33,7 +33,9 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = BASE_DIR / "schema" / "schema_health.sql"
-DB_PATH = os.getenv("HEALTH_DB_PATH", str(BASE_DIR / "health.db"))
+# Resolved against this file, not the caller's cwd: cron runs from the home
+# directory, and a relative path would quietly start a second database there.
+DB_PATH = str(BASE_DIR / os.getenv("HEALTH_DB_PATH", "health.db"))
 
 # Never written to the archive, whatever else the phone sends.
 SECRET_HEADERS = {"authorization", "cookie", "proxy-authorization"}

@@ -28,9 +28,10 @@ import hmac
 import json
 import logging
 import os
+import sqlite3
 import sys
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -64,8 +65,46 @@ SCOPE_INGEST = "ingest:write"
 MAX_INGEST_BYTES = int(os.getenv("HEALTH_MAX_INGEST_MB", "100")) * 1024 * 1024
 
 
+MAX_LIMIT = 500
+
+# Columns that may be interpolated into an ORDER BY clause. Anything reaching
+# an ORDER BY must come from this set — it cannot be parameterised.
+STRAVA_ORDER_COLUMNS = {
+    "date", "start_date_local", "distance_km", "moving_time", "elapsed_time_min",
+    "pace_min_per_km", "total_elevation_gain", "average_heartrate",
+    "max_heartrate", "cadence_spm", "suffer_score", "calories", "name",
+}
+
+RUN_TYPES = ("Run", "TrailRun", "VirtualRun")
+
+
 def _json(payload: Any) -> str:
     return json.dumps(payload, indent=2, default=str)
+
+
+def _rows(rows) -> List[Dict[str, Any]]:
+    # Blobs (the archived request bodies) are reported by size, not dumped.
+    return [
+        {k: (f"<{len(v)} bytes>" if isinstance(v, bytes) else v) for k, v in dict(r).items()}
+        for r in rows
+    ]
+
+
+def _clock(seconds: Optional[float]) -> Optional[str]:
+    """Seconds as h:mm:ss or m:ss — how a runner reads a time."""
+    if seconds is None:
+        return None
+    seconds = int(round(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, sec = divmod(rest, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def _pace(seconds: Optional[float], metres: Optional[float]) -> Optional[str]:
+    """Pace as m:ss per km."""
+    if not seconds or not metres:
+        return None
+    return _clock(seconds / (metres / 1000.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,7 +119,325 @@ def get_sync_status(limit: int = 20) -> str:
     Health Auto Export can only run while the iPhone is unlocked, so a gap
     here usually means the phone, not the server.
     """
-    return _json(ingest.recent_ingests(max(1, min(limit, 200))))
+    status = ingest.recent_ingests(max(1, min(limit, 200)))
+    with get_db() as conn:
+        count, synced, newest = conn.execute(
+            "SELECT COUNT(*), MAX(synced_at), MAX(start_date_local) FROM strava_activities"
+        ).fetchone()
+    status["strava"] = {
+        "activities": count,
+        "last_synced_at": synced,
+        "newest_activity": newest,
+    }
+    return _json(status)
+
+
+# ── Strava ───────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def query_strava_activities(
+    sport_type: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_distance_km: Optional[float] = None,
+    max_distance_km: Optional[float] = None,
+    limit: int = 50,
+    offset: int = 0,
+    order_by: str = "date",
+    order_desc: bool = True,
+) -> str:
+    """
+    List Strava activities with filters, newest first by default.
+
+    Each row carries distance_km, moving_time (seconds), pace_min_per_km
+    (decimal minutes) and pace (m:ss per km), average_heartrate, cadence_spm,
+    elevation gain, calories and the recording device. Heart rate is absent
+    for runs recorded with the phone alone.
+
+    Args:
+        sport_type: Strava sport type, e.g. 'Run', 'TrailRun', 'Walk', 'Ride'.
+        start_date: Earliest activity date (YYYY-MM-DD).
+        end_date: Latest activity date (YYYY-MM-DD).
+        min_distance_km: Minimum distance in km.
+        max_distance_km: Maximum distance in km.
+        limit: Maximum results (default 50, max 500).
+        offset: Number of results to skip, for paging.
+        order_by: Sort column (default 'date').
+        order_desc: Sort descending if True.
+    """
+    if order_by not in STRAVA_ORDER_COLUMNS:
+        return _json({"error": f"order_by must be one of {sorted(STRAVA_ORDER_COLUMNS)}"})
+    clauses, params = [], []
+    for clause, value in (
+        ("sport_type = ?", sport_type),
+        ("date >= ?", start_date),
+        ("date <= ?", end_date),
+        ("distance_km >= ?", min_distance_km),
+        ("distance_km <= ?", max_distance_km),
+    ):
+        if value is not None:
+            clauses.append(clause)
+            params.append(value)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    direction = "DESC" if order_desc else "ASC"
+    with get_db() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM strava_activity_summary {where}", params
+        ).fetchone()[0]
+        rows = _rows(conn.execute(
+            f"SELECT * FROM strava_activity_summary {where} "
+            f"ORDER BY {order_by} {direction} LIMIT ? OFFSET ?",
+            params + [max(1, min(limit, MAX_LIMIT)), max(0, offset)],
+        ).fetchall())
+    for r in rows:
+        r["pace"] = _pace(r["moving_time"], (r["distance_km"] or 0) * 1000)
+    return _json({"total": total, "count": len(rows), "activities": rows})
+
+
+@mcp.tool()
+def get_strava_activity(activity_id: int, include_streams: bool = False,
+                        max_stream_points: int = 300) -> str:
+    """
+    One Strava activity in full: summary, description, laps, 1 km splits,
+    best efforts within the run, and time in heart-rate / pace zones.
+
+    Args:
+        activity_id: Strava activity id, from query_strava_activities.
+        include_streams: Also return the recorded samples (time, distance,
+            position, altitude, speed, heart rate, cadence, grade), thinned
+            evenly to at most max_stream_points.
+        max_stream_points: Upper bound on samples returned (default 300,
+            max 2000). The stored stream is roughly one sample per second.
+    """
+    with get_db() as conn:
+        summary = conn.execute(
+            "SELECT * FROM strava_activity_summary WHERE id = ?", (activity_id,)
+        ).fetchone()
+        if summary is None:
+            return _json({"error": f"No Strava activity with id {activity_id}"})
+        activity = dict(summary)
+        activity["pace"] = _pace(activity["moving_time"], (activity["distance_km"] or 0) * 1000)
+        activity.update(dict(conn.execute(
+            """SELECT description, timezone, start_date AS start_date_utc, elev_high,
+                      elev_low, max_speed, start_lat, start_lng, workout_type,
+                      visibility, pr_count, external_id
+               FROM strava_activities WHERE id = ?""", (activity_id,)).fetchone()))
+
+        laps = _rows(conn.execute(
+            """SELECT lap_index, name, distance, elapsed_time, moving_time,
+                      total_elevation_gain, average_heartrate, max_heartrate,
+                      average_cadence * 2 AS cadence_spm
+               FROM strava_activity_laps WHERE activity_id = ? ORDER BY lap_index""",
+            (activity_id,)).fetchall())
+        splits = _rows(conn.execute(
+            """SELECT split, distance, moving_time, elapsed_time, elevation_difference,
+                      average_heartrate, average_grade_adjusted_speed
+               FROM strava_activity_splits WHERE activity_id = ? ORDER BY split""",
+            (activity_id,)).fetchall())
+        efforts = _rows(conn.execute(
+            """SELECT name, distance, elapsed_time, pr_rank
+               FROM strava_best_efforts WHERE activity_id = ? ORDER BY distance""",
+            (activity_id,)).fetchall())
+        zones = _rows(conn.execute(
+            """SELECT zone_type, zone_index, zone_min, zone_max, time
+               FROM strava_activity_zones WHERE activity_id = ?
+               ORDER BY zone_type, zone_index""", (activity_id,)).fetchall())
+
+        for row in laps + splits:
+            row["pace"] = _pace(row["moving_time"], row["distance"])
+        for row in efforts:
+            row["time"] = _clock(row["elapsed_time"])
+            row["pace"] = _pace(row["elapsed_time"], row["distance"])
+
+        result: Dict[str, Any] = {
+            "activity": activity, "laps": laps, "splits_km": splits,
+            "best_efforts": efforts, "zones": zones,
+        }
+
+        if include_streams:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM strava_activity_streams WHERE activity_id = ?",
+                (activity_id,)).fetchone()[0]
+            cap = max(1, min(max_stream_points, 2000))
+            step = max(1, -(-total // cap))
+            result["streams"] = {
+                "samples_stored": total,
+                "every_nth": step,
+                "samples": _rows(conn.execute(
+                    """SELECT time, distance, lat, lng, altitude, velocity,
+                              heartrate, cadence, grade
+                       FROM strava_activity_streams
+                       WHERE activity_id = ? AND idx % ? = 0 ORDER BY idx""",
+                    (activity_id, step)).fetchall()),
+            }
+    return _json(result)
+
+
+@mcp.tool()
+def get_running_progress(period: str = "week", limit: int = 26) -> str:
+    """
+    Running volume and pace over time, from Strava: runs, total and longest
+    distance, time, average pace, elevation and average heart rate per week
+    or month, newest first, plus Strava's own recent / year-to-date / all-time
+    run totals.
+
+    Periods without a run are simply absent — a gap in the list is a gap in
+    training. Weeks start on Monday.
+
+    Args:
+        period: 'week' (default) or 'month'.
+        limit: Number of periods to return (default 26, max 500).
+    """
+    if period not in ("week", "month"):
+        return _json({"error": "period must be 'week' or 'month'"})
+    limit = max(1, min(limit, MAX_LIMIT))
+    with get_db() as conn:
+        if period == "week":
+            rows = _rows(conn.execute(
+                "SELECT * FROM strava_weekly_running LIMIT ?", (limit,)).fetchall())
+        else:
+            marks = ", ".join("?" for _ in RUN_TYPES)
+            rows = _rows(conn.execute(
+                f"""SELECT strftime('%Y-%m', start_date_local) AS month,
+                           COUNT(*) AS runs,
+                           ROUND(SUM(distance) / 1000.0, 1) AS total_km,
+                           ROUND(MAX(distance) / 1000.0, 1) AS longest_km,
+                           ROUND(SUM(moving_time) / 3600.0, 2) AS total_hours,
+                           ROUND((SUM(moving_time) / 60.0) / (SUM(distance) / 1000.0), 2)
+                               AS pace_min_per_km,
+                           ROUND(SUM(total_elevation_gain), 0) AS elevation_m,
+                           ROUND(AVG(average_heartrate), 0) AS avg_heartrate
+                    FROM strava_activities
+                    WHERE sport_type IN ({marks}) AND distance > 0
+                    GROUP BY month ORDER BY month DESC LIMIT ?""",
+                list(RUN_TYPES) + [limit]).fetchall())
+        athlete = conn.execute(
+            """SELECT recent_run_count, recent_run_distance, recent_run_moving_time,
+                      ytd_run_count, ytd_run_distance, ytd_run_moving_time,
+                      all_run_count, all_run_distance, all_run_moving_time, synced_at
+               FROM strava_athletes LIMIT 1""").fetchone()
+
+    for r in rows:
+        r["pace"] = _clock(r["pace_min_per_km"] * 60) if r["pace_min_per_km"] else None
+    totals = {}
+    if athlete:
+        for prefix, label in (("recent", "last_4_weeks"), ("ytd", "year_to_date"), ("all", "all_time")):
+            distance, seconds = athlete[f"{prefix}_run_distance"], athlete[f"{prefix}_run_moving_time"]
+            totals[label] = {
+                "runs": athlete[f"{prefix}_run_count"],
+                "km": round((distance or 0) / 1000.0, 1),
+                "hours": round((seconds or 0) / 3600.0, 1),
+                "pace": _pace(seconds, distance),
+            }
+    return _json({"period": period, "periods": rows, "strava_totals": totals})
+
+
+@mcp.tool()
+def get_best_efforts(distance: Optional[str] = None) -> str:
+    """
+    Fastest times over standard distances, as Strava finds them inside runs
+    (a 5K best can come from the middle of a 10 km run). Only GPS runs have
+    them.
+
+    Without `distance`: the best time per distance, with the run it came from.
+    With `distance`: every effort over that distance in date order — the
+    progression.
+
+    Args:
+        distance: One of Strava's names, e.g. '400m', '1/2 mile', '1K',
+            '1 mile', '2 mile', '5K', '10K', '15K', '10 mile', '20K',
+            'Half-Marathon', 'Marathon'.
+    """
+    with get_db() as conn:
+        if distance is None:
+            rows = _rows(conn.execute(
+                """SELECT e.name, e.distance, MIN(e.elapsed_time) AS elapsed_time,
+                          date(e.start_date_local) AS date, e.activity_id,
+                          a.name AS activity_name,
+                          (SELECT COUNT(*) FROM strava_best_efforts x WHERE x.name = e.name)
+                              AS efforts
+                   FROM strava_best_efforts e
+                   JOIN strava_activities a ON a.id = e.activity_id
+                   GROUP BY e.name ORDER BY e.distance""").fetchall())
+        else:
+            rows = _rows(conn.execute(
+                """SELECT e.name, e.distance, e.elapsed_time,
+                          date(e.start_date_local) AS date, e.activity_id,
+                          a.name AS activity_name, e.pr_rank
+                   FROM strava_best_efforts e
+                   JOIN strava_activities a ON a.id = e.activity_id
+                   WHERE e.name = ? COLLATE NOCASE ORDER BY e.start_date_local""",
+                (distance,)).fetchall())
+            if not rows:
+                names = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT name FROM strava_best_efforts ORDER BY distance")]
+                return _json({"error": f"No efforts named '{distance}'", "available": names})
+    for r in rows:
+        r["time"] = _clock(r["elapsed_time"])
+        r["pace"] = _pace(r["elapsed_time"], r["distance"])
+    return _json({"distance": distance, "efforts": rows})
+
+
+@mcp.tool()
+def get_strava_athlete() -> str:
+    """Strava profile, run totals (last 4 weeks, year to date, all time) and shoes."""
+    with get_db() as conn:
+        athlete = conn.execute(
+            """SELECT id, firstname, lastname, city, country, sex, weight,
+                      created_at, recent_run_count, recent_run_distance,
+                      ytd_run_count, ytd_run_distance, all_run_count,
+                      all_run_distance, synced_at
+               FROM strava_athletes LIMIT 1""").fetchone()
+        gear = _rows(conn.execute(
+            """SELECT name, brand_name, model_name, gear_type,
+                      ROUND(distance / 1000.0, 1) AS distance_km, retired
+               FROM strava_gear ORDER BY distance DESC""").fetchall())
+    if athlete is None:
+        return _json({"error": "No Strava data yet — has strava_downloader.py run?"})
+    return _json({"athlete": dict(athlete), "gear": gear})
+
+
+@mcp.tool()
+def execute_sql(query: str, limit: int = 100) -> str:
+    """
+    Run a custom read-only SELECT query against the database.
+
+    Strava tables: strava_activities, strava_activity_laps,
+    strava_activity_splits (1 km), strava_best_efforts, strava_activity_zones,
+    strava_activity_streams (per sample), strava_athletes, strava_gear.
+    Strava views: strava_activity_summary, strava_weekly_running,
+    strava_monthly_stats.
+    Apple Health: ingest_log (one row per export received; bodies not parsed
+    into tables yet).
+
+    Strava units: distance in metres, time in seconds, speed in m/s;
+    average_cadence counts one foot (double it for steps per minute);
+    start_date_local is local wall time. The views convert to km and min/km.
+    Only SELECT statements are permitted.
+
+    Args:
+        query: SQL SELECT query (WITH … SELECT is allowed).
+        limit: Maximum rows (default 100, max 1000).
+    """
+    stripped = query.strip().upper()
+    if not stripped.startswith(("SELECT", "WITH")):
+        return _json({"error": "Only SELECT queries are permitted"})
+    # Block multi-statement payloads smuggled in behind a semicolon.
+    if ";" in query.strip().rstrip(";"):
+        return _json({"error": "Multiple SQL statements are not permitted"})
+
+    sql = query.strip().rstrip(";")
+    if "LIMIT" not in stripped:
+        sql += f" LIMIT {max(1, min(limit, 1000))}"
+
+    try:
+        with get_db() as conn:
+            # Defence in depth: reject writes even if they slip past the checks.
+            conn.execute("PRAGMA query_only = ON")
+            rows = conn.execute(sql).fetchall()
+        return _json({"count": len(rows), "rows": _rows(rows)})
+    except sqlite3.Error as e:
+        return _json({"error": str(e)})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
